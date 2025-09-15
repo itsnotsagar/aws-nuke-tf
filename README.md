@@ -1,4 +1,4 @@
-# AWS Nuke Terraform Pipeline
+# AWS Nuke - GitLab Pipeline
 
 A GitLab CI/CD pipeline for safely nuking AWS accounts using [aws-nuke](https://github.com/ekristen/aws-nuke) with automated configuration management and multi-stage approval process.
 

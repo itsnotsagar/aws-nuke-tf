@@ -1,0 +1,8 @@
+Accounts:
+  - "AccountId": "536197253064"
+    "CLSP": "aft-account-1"
+  - "AccountId": "550435500965"
+    "CLSP": "aft-account-2"
+  - "AccountId": "550435500965"
+    "CLSP": "aft-account-3"
+    "AccountAlias": "aft-account-3"

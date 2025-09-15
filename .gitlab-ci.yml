@@ -1,0 +1,355 @@
+stages:
+  - detect-changes
+  - display-account
+  - manual-approval-1
+  - dry-run
+  - manual-approval-2
+  - execute
+
+workflow:
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event" && $CI_MERGE_REQUEST_TARGET_BRANCH_NAME == "main"
+      changes:
+        - close-account/nuke.yml
+
+detect-account-changes:
+  stage: detect-changes
+  tags:
+    - test-org
+  script:
+    - |
+      echo "Detecting account entry in nuke.yml..."
+      
+      # Get the diff for nuke.yml between target branch and current branch
+      git fetch origin $CI_MERGE_REQUEST_TARGET_BRANCH_NAME
+      
+      # Check if nuke.yml has changes
+      if ! git diff origin/$CI_MERGE_REQUEST_TARGET_BRANCH_NAME...HEAD --name-only | grep -q "close-account/nuke.yml"; then
+        echo "No changes detected in nuke.yml"
+        exit 1
+      fi
+      
+      # Get the current version of the file
+      git show HEAD:close-account/nuke.yml > current_nuke.yml
+      
+      # Simple extraction of the last account entry
+      echo "Extracting the last account entry..."
+      
+      # Get the last AccountId
+      ACCOUNT_ID=$(grep -o '"AccountId"[[:space:]]*:[[:space:]]*"[^"]*"' current_nuke.yml | tail -1 | sed 's/.*"AccountId"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/')
+      echo "Account ID: $ACCOUNT_ID"
+      
+      # Get the last CLSP that corresponds to the last AccountId
+      # Find the line number of the last AccountId
+      LAST_ACCOUNTID_LINE=$(grep -n '"AccountId"' current_nuke.yml | tail -1 | cut -d: -f1)
+      
+      # Find the next CLSP after this line
+      CLSP_VALUE=$(tail -n +$LAST_ACCOUNTID_LINE current_nuke.yml | grep -m 1 -o '"CLSP"[[:space:]]*:[[:space:]]*"[^"]*"' | sed 's/.*"CLSP"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/')
+      echo "CLSP: $CLSP_VALUE"
+      
+      # Check if an Alias exists for this account
+      HAS_ALIAS="false"
+      if tail -n +$LAST_ACCOUNTID_LINE current_nuke.yml | grep -m 3 -q '"AccountAlias"'; then
+        HAS_ALIAS="true"
+        ACCOUNT_ALIAS=$(tail -n +$LAST_ACCOUNTID_LINE current_nuke.yml | grep -m 1 -o '"AccountAlias"[[:space:]]*:[[:space:]]*"[^"]*"' | sed 's/.*"AccountAlias"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/')
+        echo "Account Alias: $ACCOUNT_ALIAS"
+      else
+        echo "No Alias provided"
+      fi
+      
+      # Save the information
+      echo "ACCOUNT_ID=$ACCOUNT_ID" > account_info.env
+      echo "CLSP_VALUE=$CLSP_VALUE" >> account_info.env
+      echo "HAS_ALIAS=$HAS_ALIAS" >> account_info.env
+      if [ "$HAS_ALIAS" = "true" ]; then
+        echo "ACCOUNT_ALIAS=$ACCOUNT_ALIAS" >> account_info.env
+      fi
+      
+      echo "Account information extracted:"
+      cat account_info.env
+  artifacts:
+    reports:
+      dotenv: account_info.env
+    paths:
+      - account_info.env
+    expire_in: 1 day
+
+display-account:
+  stage: display-account
+  tags:
+    - test-org
+  dependencies:
+    - detect-account-changes
+  script:
+    - |
+      echo "=== ACCOUNT INFO ==="
+      echo "Account ID: $ACCOUNT_ID"
+      echo "CLSP: $CLSP_VALUE"
+      if [ "$HAS_ALIAS" = "true" ]; then
+        echo "Account Alias: $ACCOUNT_ALIAS"
+      else
+        echo "Account Alias: Not provided"
+      fi
+      echo "===================="
+
+manual-approval-1:
+  stage: manual-approval-1
+  tags:
+    - test-org
+  dependencies:
+    - detect-account-changes
+  script:
+    - |
+      echo "=== APPROVAL REQUIRED (1/2) ==="
+      echo "You are about to proceed with AWS nuke dry-run for:"
+      echo "Account ID: $ACCOUNT_ID"
+      echo "CLSP: $CLSP_VALUE"
+      if [ "$HAS_ALIAS" = "true" ]; then
+        echo "Account Alias: $ACCOUNT_ALIAS"
+      else
+        echo "Account Alias: Not provided"
+      fi
+      echo ""
+      echo "Please review the account details above and approve to proceed with the dry-run."
+  when: manual
+  allow_failure: false
+
+aws-nuke-dry-run:
+  stage: dry-run
+  tags:
+    - test-org
+  dependencies:
+    - detect-account-changes
+    - manual-approval-1
+  before_script:
+    - |
+      echo "Downloading aws-nuke from GitHub releases..."
+      curl -L -o aws-nuke.tar.gz "https://github.com/ekristen/aws-nuke/releases/download/v3.58.0/aws-nuke-v3.58.0-linux-amd64.tar.gz"
+
+      tar -xzf aws-nuke.tar.gz
+      chmod +x aws-nuke
+      
+      # Verify installation
+      ./aws-nuke version
+      
+      # Prepare config file
+      chmod +x scripts/prepare-config.sh
+      if [ "$HAS_ALIAS" = "true" ]; then
+        ./scripts/prepare-config.sh "$ACCOUNT_ID" "$HAS_ALIAS" "$ACCOUNT_ALIAS"
+      else
+        ./scripts/prepare-config.sh "$ACCOUNT_ID" "$HAS_ALIAS"
+      fi
+      
+      # Verify config file was created
+      if [ ! -f "config-prepared.yml" ]; then
+        echo "Error: config-prepared.yml was not created"
+        exit 1
+      fi
+      
+      echo "Config file created successfully:"
+      ls -la config-prepared.yml
+  script:
+    - |
+      echo "Starting AWS Nuke dry-run for Account ID: $ACCOUNT_ID"
+      echo "Account has alias: $HAS_ALIAS"
+      echo "CLSP: $CLSP_VALUE"
+      
+      # Verify config file exists before proceeding
+      if [ ! -f "config-prepared.yml" ]; then
+        echo "Error: config-prepared.yml not found"
+        exit 1
+      fi
+      
+      echo "Config file contents:"
+      cat config-prepared.yml
+      
+      # Assume role for target account
+      echo "Assuming AWSAFTExecution role for account $ACCOUNT_ID..."
+      ROLE_ARN="arn:aws:iam::${ACCOUNT_ID}:role/AWSAFTExecution"
+      
+      # Get temporary credentials
+      ASSUME_ROLE_OUTPUT=$(aws sts assume-role \
+        --role-arn $ROLE_ARN \
+        --role-session-name "aws-nuke-session-$(date +%s)" \
+        --output json)
+      
+      export TARGET_ACCESS_KEY=$(echo $ASSUME_ROLE_OUTPUT | jq -r '.Credentials.AccessKeyId')
+      export TARGET_SECRET_KEY=$(echo $ASSUME_ROLE_OUTPUT | jq -r '.Credentials.SecretAccessKey')
+      export TARGET_SESSION_TOKEN=$(echo $ASSUME_ROLE_OUTPUT | jq -r '.Credentials.SessionToken')
+      
+      echo "Successfully assumed role for account $ACCOUNT_ID"
+      
+      # Use the prepared config file
+      CONFIG_FILE="config-prepared.yml"
+      echo "Using prepared config file: $CONFIG_FILE"
+      
+      # Run aws-nuke dry-run and capture logs
+      echo "Running AWS Nuke dry-run..."
+      LOG_FILE="aws-nuke-removal-$(date +%Y-%m-%d-%H%M%S).log"
+      
+      # Build aws-nuke command with conditional --no-alias-check flag
+      NUKE_CMD="./aws-nuke run --no-prompt -c $CONFIG_FILE --access-key-id $TARGET_ACCESS_KEY --secret-access-key $TARGET_SECRET_KEY --session-token $TARGET_SESSION_TOKEN --quiet"
+      
+      if [ "$HAS_ALIAS" = "false" ]; then
+        echo "Adding --no-alias-check flag for account without alias"
+        NUKE_CMD="$NUKE_CMD --no-alias-check"
+      fi
+      
+      # Run aws-nuke dry-run and capture exit code, but don't fail the pipeline
+      set +e  # Disable exit on error temporarily
+      $NUKE_CMD | tee >(grep -E "(global|[a-z]+-[a-z]+-[0-9]+) - .* - would remove" > $LOG_FILE)
+      NUKE_EXIT_CODE=$?
+      set -e  # Re-enable exit on error
+      
+      echo "Dry-run completed with exit code: $NUKE_EXIT_CODE. Log file: $LOG_FILE"
+      echo "LOG_FILE=$LOG_FILE" >> dry_run_info.env
+      
+      # Log the result but don't fail the pipeline
+      if [ $NUKE_EXIT_CODE -eq 0 ]; then
+        echo "✅ AWS Nuke dry-run completed successfully"
+      else
+        echo "⚠️  AWS Nuke dry-run completed with warnings/errors (exit code: $NUKE_EXIT_CODE)"
+        echo "This is expected when some resources cannot be analyzed (e.g., permission issues, missing resources, etc.)"
+        echo "Check the dry-run log for details"
+      fi
+      
+      # Copy account variables to maintain them between stages
+      cat account_info.env >> dry_run_info.env
+    - |
+      # Display summary
+      if [ -f "$LOG_FILE" ]; then
+        echo "=== RESOURCES THAT WOULD BE REMOVED ==="
+        cat $LOG_FILE
+        echo "=== END OF REMOVAL LIST ==="
+      else
+        echo "No resources found for removal"
+      fi
+    - |
+      unset TARGET_ACCESS_KEY
+      unset TARGET_SECRET_KEY
+      unset TARGET_SESSION_TOKEN
+  artifacts:
+    reports:
+      dotenv: dry_run_info.env
+    paths:
+      - "aws-nuke-removal-*.log"
+      - dry_run_info.env
+      - aws-nuke
+      - config-prepared.yml
+      - account_info.env
+      - scripts/prepare-config.sh
+    expire_in: 1 day
+
+manual-approval-2:
+  stage: manual-approval-2
+  tags:
+    - test-org
+  dependencies:
+    - detect-account-changes
+    - aws-nuke-dry-run
+  script:
+    - |
+      echo "=== APPROVAL REQUIRED (2/2) ==="
+      echo "You are about to proceed with ACTUAL AWS NUKE EXECUTION for:"
+      echo "Account ID: $ACCOUNT_ID"
+      echo "CLSP: $CLSP_VALUE"
+      if [ "$HAS_ALIAS" = "true" ]; then
+        echo "Account Alias: $ACCOUNT_ALIAS"
+      else
+        echo "Account Alias: Not provided"
+      fi
+      echo ""
+      echo "⚠️ WARNING: This will PERMANENTLY DELETE resources identified in the dry-run!"
+      echo "Please review the dry-run results and approve to proceed with the actual deletion."
+  when: manual
+  allow_failure: false
+
+aws-nuke-execute:
+  stage: execute
+  tags:
+    - test-org
+  dependencies:
+    - detect-account-changes
+    - aws-nuke-dry-run
+    - manual-approval-2
+  before_script:
+    - |
+      # Use aws-nuke and config from previous stage artifacts
+      echo "Using aws-nuke binary and config from dry-run stage"
+      chmod +x aws-nuke
+      
+      # Verify aws-nuke is available
+      ./aws-nuke version
+      
+      # Verify config file exists
+      if [ ! -f "config-prepared.yml" ]; then
+        echo "Error: config-prepared.yml not found in artifacts"
+        exit 1
+      fi
+      
+      echo "Config file found:"
+      cat config-prepared.yml
+  script:
+    - |
+      echo "Starting AWS Nuke EXECUTION for Account ID: $ACCOUNT_ID"
+      echo "CLSP: $CLSP_VALUE"
+      echo "⚠️  THIS WILL PERMANENTLY DELETE RESOURCES!"
+      
+      # Assume role for target account
+      echo "Assuming AWSAFTExecution role for account $ACCOUNT_ID..."
+      ROLE_ARN="arn:aws:iam::${ACCOUNT_ID}:role/AWSAFTExecution"
+      
+      # Get temporary credentials
+      ASSUME_ROLE_OUTPUT=$(aws sts assume-role \
+        --role-arn $ROLE_ARN \
+        --role-session-name "aws-nuke-execution-$(date +%s)" \
+        --output json)
+      
+      export TARGET_ACCESS_KEY=$(echo $ASSUME_ROLE_OUTPUT | jq -r '.Credentials.AccessKeyId')
+      export TARGET_SECRET_KEY=$(echo $ASSUME_ROLE_OUTPUT | jq -r '.Credentials.SecretAccessKey')
+      export TARGET_SESSION_TOKEN=$(echo $ASSUME_ROLE_OUTPUT | jq -r '.Credentials.SessionToken')
+      
+      echo "Successfully assumed role for account $ACCOUNT_ID"
+      
+      # Use the prepared config file
+      CONFIG_FILE="config-prepared.yml"
+      echo "Using prepared config file: $CONFIG_FILE"
+      
+      # Execute aws-nuke
+      echo "Executing AWS Nuke..."
+      EXECUTION_LOG="aws-nuke-execution-$(date +%Y-%m-%d-%H%M%S).log"
+      
+      # Build aws-nuke command with conditional --no-alias-check flag
+      NUKE_CMD="./aws-nuke run --no-prompt -c $CONFIG_FILE --access-key-id $TARGET_ACCESS_KEY --secret-access-key $TARGET_SECRET_KEY --session-token $TARGET_SESSION_TOKEN --no-dry-run --quiet"
+      
+      if [ "$HAS_ALIAS" = "false" ]; then
+        echo "Adding --no-alias-check flag for account without alias"
+        NUKE_CMD="$NUKE_CMD --no-alias-check"
+      fi
+      
+      # Run aws-nuke and capture exit code, but don't fail the pipeline
+      set +e  # Disable exit on error temporarily
+      $NUKE_CMD | tee >(grep -E "(global|[a-z]+-[a-z]+-[0-9]+) - .* - removed" > $EXECUTION_LOG)
+      NUKE_EXIT_CODE=$?
+      set -e  # Re-enable exit on error
+      
+      echo "AWS Nuke execution completed with exit code: $NUKE_EXIT_CODE"
+      echo "Execution log file: $EXECUTION_LOG"
+      
+      # Log the result but don't fail the pipeline
+      if [ $NUKE_EXIT_CODE -eq 0 ]; then
+        echo "✅ AWS Nuke completed successfully"
+      else
+        echo "⚠️  AWS Nuke completed with warnings/errors (exit code: $NUKE_EXIT_CODE)"
+        echo "This is expected when some resources cannot be deleted (e.g., protected resources, dependencies, etc.)"
+        echo "Check the execution log for details on what was and wasn't deleted"
+      fi
+    - |
+      unset TARGET_ACCESS_KEY
+      unset TARGET_SECRET_KEY
+      unset TARGET_SESSION_TOKEN
+  artifacts:
+    when: always
+    paths:
+      - "aws-nuke-execution-*.log"
+    expire_in: 1 day

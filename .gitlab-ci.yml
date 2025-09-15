@@ -15,7 +15,7 @@ workflow:
 detect-account-changes:
   stage: detect-changes
   tags:
-    - test-org
+    - test-runner
   script:
     - |
       echo "Detecting account entry in nuke.yml..."
@@ -77,7 +77,7 @@ detect-account-changes:
 display-account:
   stage: display-account
   tags:
-    - test-org
+    - test-runner
   dependencies:
     - detect-account-changes
   script:
@@ -95,7 +95,7 @@ display-account:
 manual-approval-1:
   stage: manual-approval-1
   tags:
-    - test-org
+    - test-runner
   dependencies:
     - detect-account-changes
   script:
@@ -117,7 +117,7 @@ manual-approval-1:
 aws-nuke-dry-run:
   stage: dry-run
   tags:
-    - test-org
+    - test-runner
   dependencies:
     - detect-account-changes
     - manual-approval-1
@@ -243,7 +243,7 @@ aws-nuke-dry-run:
 manual-approval-2:
   stage: manual-approval-2
   tags:
-    - test-org
+    - test-runner
   dependencies:
     - detect-account-changes
     - aws-nuke-dry-run
@@ -267,7 +267,7 @@ manual-approval-2:
 aws-nuke-execute:
   stage: execute
   tags:
-    - test-org
+    - test-runner
   dependencies:
     - detect-account-changes
     - aws-nuke-dry-run
